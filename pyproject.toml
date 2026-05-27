@@ -1,0 +1,10 @@
+[project]
+name = "purepychess"
+requires-python = ">=3.10"
+dependencies = ["torch", "python-chess", "numpy", "huggingface_hub"]
+
+[project.optional-dependencies]
+train = ["h5py"]
+
+[project.scripts]
+purepychess = "purepychess.engine:main"
