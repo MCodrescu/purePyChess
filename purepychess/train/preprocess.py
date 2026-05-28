@@ -141,9 +141,14 @@ def preprocess(pgn_path: str, output_dir: str) -> None:
             with open(p, "rt", encoding="utf-8", errors="replace") as fh:
                 yield fh
 
+    skipped = 0
     with _open_pgn() as fh:
         while True:
-            game = chess.pgn.read_game(fh)
+            try:
+                game = chess.pgn.read_game(fh)
+            except Exception:
+                skipped += 1
+                continue
             if game is None:
                 break
             if not _game_passes_filter(game):
@@ -153,22 +158,29 @@ def preprocess(pgn_path: str, output_dir: str) -> None:
             board     = game.board()
             prev_board: chess.Board | None = None
 
-            for move in game.mainline_moves():
-                tensor    = board_to_tensor(board, prev_board).astype(np.float16)
-                move_idx  = move_to_index(move)
+            try:
+                for move in game.mainline_moves():
+                    tensor    = board_to_tensor(board, prev_board).astype(np.float16)
+                    move_idx  = move_to_index(move)
 
-                states.append(tensor)
-                moves.append(move_idx)
-                wdls.append(wdl_label)
-                total += 1
+                    states.append(tensor)
+                    moves.append(move_idx)
+                    wdls.append(wdl_label)
+                    total += 1
 
-                prev_board = board.copy()
-                board.push(move)
+                    prev_board = board.copy()
+                    board.push(move)
 
-                if len(states) >= SHARD_SIZE:
-                    _write_shard(out, shard_idx, states, moves, wdls)
-                    shard_idx += 1
-                    states, moves, wdls = [], [], []
+                    if len(states) >= SHARD_SIZE:
+                        _write_shard(out, shard_idx, states, moves, wdls)
+                        shard_idx += 1
+                        states, moves, wdls = [], [], []
+            except Exception:
+                skipped += 1
+                # Discard any partially accumulated positions for this game
+                states = states[:total % SHARD_SIZE] if total % SHARD_SIZE else []
+                moves  = moves[:total % SHARD_SIZE]  if total % SHARD_SIZE else []
+                wdls   = wdls[:total % SHARD_SIZE]   if total % SHARD_SIZE else []
 
     # Flush remaining positions
     if states:
@@ -177,7 +189,7 @@ def preprocess(pgn_path: str, output_dir: str) -> None:
 
     print(
         f"\nPreprocessing complete: {total:,} positions → "
-        f"{shard_idx} shard(s) in {out}"
+        f"{shard_idx} shard(s) in {out}  ({skipped} malformed games skipped)"
     )
 
 
