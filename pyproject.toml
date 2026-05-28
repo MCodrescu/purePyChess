@@ -1,9 +1,10 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "purepychess"
+version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = ["torch", "python-chess", "numpy", "huggingface_hub"]
 
@@ -12,3 +13,6 @@ train = ["h5py"]
 
 [project.scripts]
 purepychess = "purepychess.engine:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
