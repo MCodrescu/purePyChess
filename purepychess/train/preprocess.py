@@ -19,10 +19,7 @@ from __future__ import annotations
 import argparse
 import bz2
 import io
-import itertools
-import os
 import re
-from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -138,7 +135,6 @@ def preprocess(
     pgn_path: str,
     output_dir: str,
     max_positions: int | None = None,
-    num_workers: int | None = None,
 ) -> None:
     """Convert a Lichess PGN (.pgn, .pgn.bz2, or .pgn.zst) file to npz shards.
 
@@ -150,14 +146,9 @@ def preprocess(
         Directory where shard files are written.
     max_positions:
         Stop after collecting this many positions. ``None`` = no limit.
-    num_workers:
-        Worker processes for parallel encoding. Defaults to ``os.cpu_count() - 1``.
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-
-    if num_workers is None:
-        num_workers = max(1, (os.cpu_count() or 2) - 1)
 
     states: list[np.ndarray] = []
     moves:  list[int]        = []
@@ -203,25 +194,19 @@ def preprocess(
                 continue
             yield moves_uci, _result_to_wdl(game.headers.get("Result", "*"))
 
-    print(f"Preprocessing with {num_workers} worker(s)"
-          + (f", stopping at {max_positions:,} positions" if max_positions else "") + " ...")
+    limit = f", stopping at {max_positions:,} positions" if max_positions else ""
+    print(f"Preprocessing{limit} ...")
 
-    with _open_pgn() as fh, ProcessPoolExecutor(max_workers=num_workers) as pool:
-        # pool.map() eagerly submits ALL items from its iterator before yielding
-        # any results, so we must cap the generator here — not inside the loop.
-        # Each game has ≥ 1 move, so islice(N) guarantees ≥ N positions available.
-        game_stream = _game_iter(fh)
-        if max_positions is not None:
-            game_stream = itertools.islice(game_stream, max_positions)
-
-        for encoded in pool.map(_encode_game_positions, game_stream, chunksize=64):
+    with _open_pgn() as fh:
+        for moves_uci, wdl_label in _game_iter(fh):
+            encoded = _encode_game_positions((moves_uci, wdl_label))
             if encoded is None:
                 skipped += 1
                 continue
-            for tensor, move_idx, wdl_label in encoded:
+            for tensor, move_idx, wdl_enc in encoded:
                 states.append(tensor)
                 moves.append(move_idx)
-                wdls.append(wdl_label)
+                wdls.append(wdl_enc)
                 total += 1
                 if len(states) >= SHARD_SIZE:
                     _write_shard(out, shard_idx, states, moves, wdls)
