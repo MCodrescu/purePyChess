@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import argparse
 import bz2
+import io
 import re
+from contextlib import contextmanager
 from pathlib import Path
 
 import chess.pgn
@@ -122,9 +124,24 @@ def preprocess(pgn_path: str, output_dir: str) -> None:
     shard_idx = 0
     total     = 0
 
-    opener = bz2.open if str(pgn_path).endswith(".bz2") else open
+    p = str(pgn_path)
 
-    with opener(pgn_path, "rt", encoding="utf-8", errors="replace") as fh:
+    @contextmanager
+    def _open_pgn():
+        if p.endswith(".zst"):
+            import zstandard as zstd
+            with open(p, "rb") as raw:
+                dctx = zstd.ZstdDecompressor()
+                with dctx.stream_reader(raw) as reader:
+                    yield io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
+        elif p.endswith(".bz2"):
+            with bz2.open(p, "rt", encoding="utf-8", errors="replace") as fh:
+                yield fh
+        else:
+            with open(p, "rt", encoding="utf-8", errors="replace") as fh:
+                yield fh
+
+    with _open_pgn() as fh:
         while True:
             game = chess.pgn.read_game(fh)
             if game is None:
