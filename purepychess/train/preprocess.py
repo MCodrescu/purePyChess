@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import bz2
 import io
+import itertools
 import os
 import re
 from concurrent.futures import ProcessPoolExecutor
@@ -206,7 +207,14 @@ def preprocess(
           + (f", stopping at {max_positions:,} positions" if max_positions else "") + " ...")
 
     with _open_pgn() as fh, ProcessPoolExecutor(max_workers=num_workers) as pool:
-        for encoded in pool.map(_encode_game_positions, _game_iter(fh), chunksize=64):
+        # pool.map() eagerly submits ALL items from its iterator before yielding
+        # any results, so we must cap the generator here — not inside the loop.
+        # Each game has ≥ 1 move, so islice(N) guarantees ≥ N positions available.
+        game_stream = _game_iter(fh)
+        if max_positions is not None:
+            game_stream = itertools.islice(game_stream, max_positions)
+
+        for encoded in pool.map(_encode_game_positions, game_stream, chunksize=64):
             if encoded is None:
                 skipped += 1
                 continue
