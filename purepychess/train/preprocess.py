@@ -19,7 +19,9 @@ from __future__ import annotations
 import argparse
 import bz2
 import io
+import os
 import re
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -81,6 +83,32 @@ def _result_to_wdl(result: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Worker function (module-level so it is picklable for multiprocessing)
+# ---------------------------------------------------------------------------
+
+def _encode_game_positions(game_data: tuple) -> list | None:
+    """Encode every position in one game. Runs in a worker process."""
+    moves_uci, wdl_label = game_data
+    try:
+        import chess
+        import numpy as np
+        from purepychess.encoding import board_to_tensor, move_to_index
+
+        board = chess.Board()
+        prev_board: chess.Board | None = None
+        out = []
+        for uci in moves_uci:
+            move = chess.Move.from_uci(uci)
+            tensor = board_to_tensor(board, prev_board).astype(np.float16)
+            out.append((tensor, move_to_index(move), wdl_label))
+            prev_board = board.copy()
+            board.push(move)
+        return out
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Shard writer
 # ---------------------------------------------------------------------------
 
@@ -105,24 +133,37 @@ def _write_shard(
 # Main preprocessing function
 # ---------------------------------------------------------------------------
 
-def preprocess(pgn_path: str, output_dir: str) -> None:
-    """Convert a Lichess PGN (.pgn or .pgn.bz2) file to npz shards.
+def preprocess(
+    pgn_path: str,
+    output_dir: str,
+    max_positions: int | None = None,
+    num_workers: int | None = None,
+) -> None:
+    """Convert a Lichess PGN (.pgn, .pgn.bz2, or .pgn.zst) file to npz shards.
 
     Parameters
     ----------
     pgn_path:
-        Path to the Lichess monthly PGN file (plain or bz2-compressed).
+        Path to the Lichess monthly PGN file.
     output_dir:
         Directory where shard files are written.
+    max_positions:
+        Stop after collecting this many positions. ``None`` = no limit.
+    num_workers:
+        Worker processes for parallel encoding. Defaults to ``os.cpu_count() - 1``.
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
+
+    if num_workers is None:
+        num_workers = max(1, (os.cpu_count() or 2) - 1)
 
     states: list[np.ndarray] = []
     moves:  list[int]        = []
     wdls:   list[int]        = []
     shard_idx = 0
     total     = 0
+    skipped   = 0
 
     p = str(pgn_path)
 
@@ -141,8 +182,9 @@ def preprocess(pgn_path: str, output_dir: str) -> None:
             with open(p, "rt", encoding="utf-8", errors="replace") as fh:
                 yield fh
 
-    skipped = 0
-    with _open_pgn() as fh:
+    def _game_iter(fh):
+        """Yield (moves_uci, wdl_label) for each game that passes filters."""
+        nonlocal skipped
         while True:
             try:
                 game = chess.pgn.read_game(fh)
@@ -153,34 +195,32 @@ def preprocess(pgn_path: str, output_dir: str) -> None:
                 break
             if not _game_passes_filter(game):
                 continue
-
-            wdl_label = _result_to_wdl(game.headers.get("Result", "*"))
-            board     = game.board()
-            prev_board: chess.Board | None = None
-
             try:
-                for move in game.mainline_moves():
-                    tensor    = board_to_tensor(board, prev_board).astype(np.float16)
-                    move_idx  = move_to_index(move)
-
-                    states.append(tensor)
-                    moves.append(move_idx)
-                    wdls.append(wdl_label)
-                    total += 1
-
-                    prev_board = board.copy()
-                    board.push(move)
-
-                    if len(states) >= SHARD_SIZE:
-                        _write_shard(out, shard_idx, states, moves, wdls)
-                        shard_idx += 1
-                        states, moves, wdls = [], [], []
+                moves_uci = [m.uci() for m in game.mainline_moves()]
             except Exception:
                 skipped += 1
-                # Discard any partially accumulated positions for this game
-                states = states[:total % SHARD_SIZE] if total % SHARD_SIZE else []
-                moves  = moves[:total % SHARD_SIZE]  if total % SHARD_SIZE else []
-                wdls   = wdls[:total % SHARD_SIZE]   if total % SHARD_SIZE else []
+                continue
+            yield moves_uci, _result_to_wdl(game.headers.get("Result", "*"))
+
+    print(f"Preprocessing with {num_workers} worker(s)"
+          + (f", stopping at {max_positions:,} positions" if max_positions else "") + " ...")
+
+    with _open_pgn() as fh, ProcessPoolExecutor(max_workers=num_workers) as pool:
+        for encoded in pool.map(_encode_game_positions, _game_iter(fh), chunksize=64):
+            if encoded is None:
+                skipped += 1
+                continue
+            for tensor, move_idx, wdl_label in encoded:
+                states.append(tensor)
+                moves.append(move_idx)
+                wdls.append(wdl_label)
+                total += 1
+                if len(states) >= SHARD_SIZE:
+                    _write_shard(out, shard_idx, states, moves, wdls)
+                    shard_idx += 1
+                    states, moves, wdls = [], [], []
+            if max_positions and total >= max_positions:
+                break
 
     # Flush remaining positions
     if states:
@@ -201,10 +241,18 @@ def _cli() -> None:
     parser = argparse.ArgumentParser(
         description="Convert a Lichess PGN file to purePyChess npz shards."
     )
-    parser.add_argument("pgn_path",    help="Path to .pgn or .pgn.bz2 file")
-    parser.add_argument("output_dir",  help="Directory to write npz shards")
+    parser.add_argument("pgn_path",   help="Path to .pgn, .pgn.bz2, or .pgn.zst file")
+    parser.add_argument("output_dir", help="Directory to write npz shards")
+    parser.add_argument(
+        "--max-positions", type=int, default=None, metavar="N",
+        help="Stop after N positions (useful for quick tests)",
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=None, metavar="N",
+        help="Worker processes for encoding (default: cpu_count - 1)",
+    )
     args = parser.parse_args()
-    preprocess(args.pgn_path, args.output_dir)
+    preprocess(args.pgn_path, args.output_dir, args.max_positions, args.num_workers)
 
 
 if __name__ == "__main__":
